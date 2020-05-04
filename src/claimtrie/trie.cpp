@@ -117,7 +117,7 @@ CClaimTrie::CClaimTrie(std::size_t cacheBytes, bool fWipe, int height,
 CClaimTrieCacheBase::~CClaimTrieCacheBase()
 {
     if (transacting) {
-        db << "rollback";
+        db << "ROLLBACK";
         transacting = false;
     }
     claimHashQuery.used(true);
@@ -196,6 +196,27 @@ bool CClaimTrieCacheBase::haveSupportInQueue(const std::string& name, const COut
     for (auto&& row: query) {
         row >> nValidAtHeight;
         return true;
+    }
+    return false;
+}
+
+bool emptyNodeShouldExistAt(const sqlite::database& db, const std::string& name, int nNextHeight, int requiredChildren) {
+    auto end = name + std::string(256, std::numeric_limits<char>::max()); // 256 == MAX_CLAIM_NAME_SIZE + 1
+    auto query = db << "SELECT DISTINCT nodeName FROM claim "
+                        "WHERE nodeName BETWEEN ?1 AND ?2 "
+                        "AND activationHeight < ?3 AND expirationHeight >= ?3 "
+                        "ORDER BY nodeName"
+                        << name << end << nNextHeight;
+    std::unordered_set<char> ss;
+    for (auto&& row: query) {
+        std::string nn;
+        row >> nn;
+        if (nn == name)
+            return false;
+        assert(nn.size() > name.size());
+        ss.insert(nn[name.size()]);
+        if (ss.size() >= requiredChildren)
+            return true;
     }
     return false;
 }
@@ -417,14 +438,6 @@ void completeHash(uint256& partialHash, const std::string& key, int to)
         partialHash = Hash(it, it + 1, partialHash.begin(), partialHash.end());
 }
 
-uint256 verifyEmptyTrie(const std::string& name)
-{
-    if (!name.empty())
-        logPrint << "Corrupt trie near: " << name << Clog::endl;
-    assert(name.empty());
-    return emptyTrieHash;
-}
-
 uint256 CClaimTrieCacheBase::computeNodeHash(const std::string& name, int takeoverHeight)
 {
     const auto pos = name.size();
@@ -445,7 +458,7 @@ uint256 CClaimTrieCacheBase::computeNodeHash(const std::string& name, int takeov
         }
     }
 
-    return vchToHash.empty() ? verifyEmptyTrie(name) : Hash(vchToHash.begin(), vchToHash.end());
+    return vchToHash.empty() ? emptyTrieHash : Hash(vchToHash.begin(), vchToHash.end());
 }
 
 bool CClaimTrieCacheBase::checkConsistency()
@@ -675,22 +688,24 @@ bool CClaimTrieCacheBase::addSupport(const std::string& name, const COutPoint& o
 bool CClaimTrieCacheBase::removeClaim(const uint160& claimId, const COutPoint& outPoint, std::string& nodeName,
         int& validHeight, int& originalHeight)
 {
-    ensureTransacting();
-
     // this gets tricky in that we may be removing an update
     // when going forward we spend a claim (aka, call removeClaim) before updating it (aka, call addClaim)
     // when going backwards we first remove the update by calling removeClaim
     // we then undo the spend of the previous one by calling addClaim with the original data
     // in order to maintain the proper takeover height the updater will need to use our height returned here
 
-    auto query = db << "SELECT nodeName, activationHeight, originalHeight FROM claim WHERE claimID = ? AND txID = ? AND txN = ? AND expirationHeight >= ?"
+    auto query = db << "SELECT nodeName, activationHeight, originalHeight FROM claim "
+                       "WHERE claimID = ? AND txID = ? AND txN = ? AND expirationHeight >= ?"
                     << claimId << outPoint.hash << outPoint.n << nNextHeight;
     auto it = query.begin();
     if (it == query.end())
         return false;
 
     *it >> nodeName >> validHeight >> originalHeight;
-    db  << "DELETE FROM claim WHERE claimID = ? AND txID = ? and txN = ?" << claimId << outPoint.hash << outPoint.n;
+
+    ensureTransacting();
+    db  << "DELETE FROM claim WHERE claimID = ? AND txID = ? AND txN = ?"
+        << claimId << outPoint.hash << outPoint.n;
     if (!db.rows_modified())
         return false;
 
@@ -700,19 +715,10 @@ bool CClaimTrieCacheBase::removeClaim(const uint160& claimId, const COutPoint& o
     // because it's a parent one and should not be effectively erased
     // we had a bug in the old code where that situation would force a zero delay on re-add
     if (nNextHeight >= base->nMinRemovalWorkaroundHeight
-        && nNextHeight < base->nMaxRemovalWorkaroundHeight) { // TODO: hard fork this out (which we already tried once but failed)
-        // neither LIKE nor SUBSTR will use an index on a blob, but BETWEEN is a good, fast alternative
-        auto end = nodeName + std::string( 256, std::numeric_limits<char>::max()); // 256 == MAX_CLAIM_NAME_SIZE + 1
-        auto innerQuery = db << "SELECT nodeName FROM claim WHERE nodeName BETWEEN ?1 AND ?2 "
-                           "AND activationHeight < ?3 AND expirationHeight >= ?3 ORDER BY nodeName LIMIT 1"
-                        << nodeName << end << nNextHeight;
-        for (auto&& row: innerQuery) {
-            std::string shortestMatch;
-            row >> shortestMatch;
-            if (shortestMatch != nodeName)
-                // set this when there are no more claims on that name and that node still has children
-                removalWorkaround.insert(nodeName);
-        }
+        && nNextHeight < base->nMaxRemovalWorkaroundHeight
+        ) {
+        if (emptyNodeShouldExistAt(db, nodeName, nNextHeight, 1))
+            removalWorkaround.insert(nodeName);
     }
     return true;
 }
@@ -869,14 +875,30 @@ int CClaimTrieCacheBase::getDelayForName(const std::string& name, const uint160&
         return 0;
     }
 
-    // NOTE: old code had a bug in it where nodes with no claims but with children would get left in the cache after removal.
-    // This would cause the getNumBlocksOfContinuousOwnership to return zero (causing incorrect takeover height calc).
-    auto hit = removalWorkaround.find(name);
-    if (hit != removalWorkaround.end()) {
-        removalWorkaround.erase(hit);
-        return 0;
+    if (nNextHeight > base->nMaxRemovalWorkaroundHeight) {
+        if (!hasCurrentWinner)
+            return 0;
+
+        // TODO: hard fork this out! It's wrong but kept for backwards compatibility
+        // Plan: if we have no claims for this node but we do have multiple children
+        // such that we have an implicit node here then return a 0
+        if (emptyNodeShouldExistAt(db, name, nNextHeight, 2))
+            return 0;
     }
-    return hasCurrentWinner ? std::min((nNextHeight - winningTakeoverHeight) / base->nProportionalDelayFactor, 4032) : 0;
+    else {
+        // NOTE: old code had a bug in it where nodes with no claims but with children would get left in the cache after removal.
+        // This would cause the getNumBlocksOfContinuousOwnership to return zero (causing incorrect takeover height calc).
+        auto hit = removalWorkaround.find(name);
+        if (hit != removalWorkaround.end()) {
+            removalWorkaround.erase(hit);
+            return 0;
+        }
+    }
+
+    if (!hasCurrentWinner)
+        return 0;
+
+    return std::min((nNextHeight - winningTakeoverHeight) / base->nProportionalDelayFactor, 4032);
 }
 
 std::string CClaimTrieCacheBase::adjustNameForValidHeight(const std::string& name, int validHeight) const
